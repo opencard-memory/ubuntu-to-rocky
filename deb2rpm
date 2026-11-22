@@ -1,0 +1,841 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+deb2rpm - Ubuntu/Debian 명령어를 Rocky Linux(RHEL)용으로 자동 변환해서 실행
+
+사용법
+  sudo ./deb2rpm --install        # 설치: apt, dpkg, ufw ... 를 그대로 입력해도 변환 실행
+  apt install -y nginx            # (설치 후) 그냥 우분투처럼 입력
+  deb2rpm apt update              # 직접 호출
+  deb2rpm "apt update && apt install -y build-essential"
+  deb2rpm -n apt install nginx    # 실행 없이 변환 결과만 표시 (dry-run)
+  deb2rpm                         # 대화형 셸 (우분투 명령 입력 -> 변환 -> 실행)
+Python 3.6+ (Rocky 8/9 호환)
+"""
+import os
+import re
+import sys
+import shlex
+import shutil
+import subprocess
+
+VERSION = "1.0"
+SELF_PATH = "/usr/local/bin/deb2rpm"
+LINK_DIR = "/usr/bin"   # RHEL의 sudo secure_path 에는 /usr/local/bin 이 없어서 /usr/bin 에 링크
+
+SHIMS = ["deb2rpm", "apt", "apt-get", "apt-cache", "apt-mark", "aptitude", "apt-key",
+         "dpkg", "dpkg-query", "add-apt-repository", "ufw", "deluser", "addgroup",
+         "delgroup", "update-alternatives", "lsb_release", "update-grub", "update-grub2",
+         "update-rc.d", "invoke-rc.d", "netplan"]
+
+
+class Unsupported(Exception):
+    pass
+
+
+def J(tokens):
+    return " ".join(shlex.quote(t) for t in tokens)
+
+
+# ───────────────────────── 변환 테이블 ─────────────────────────
+GROUP_MAP = {"build-essential": "Development Tools"}
+
+PKG_MAP = {
+    "apache2": "httpd", "apache2-utils": "httpd-tools", "apache2-dev": "httpd-devel",
+    "libapache2-mod-php": "php", "libapache2-mod-wsgi-py3": "python3-mod_wsgi",
+    "openssh-client": "openssh-clients", "mysql-client": "mysql",
+    "mariadb-client": "mariadb", "postgresql-client": "postgresql",
+    "redis-server": "redis", "redis-tools": "redis",
+    "g++": "gcc-c++", "pkg-config": "pkgconf-pkg-config", "python3-dev": "python3-devel",
+    "python3-venv": "python3", "python-is-python3": "", "python3-distutils": "",
+    "python-dev-is-python3": "python3-devel", "golang-go": "golang",
+    "default-jdk": "java-17-openjdk-devel", "default-jre": "java-17-openjdk",
+    "dnsutils": "bind-utils", "iputils-ping": "iputils", "iproute2": "iproute",
+    "netcat": "nmap-ncat", "netcat-openbsd": "nmap-ncat", "netcat-traditional": "nmap-ncat",
+    "bind9": "bind", "bind9utils": "bind-utils", "cron": "cronie",
+    "vim-tiny": "vim-minimal", "vim-gtk3": "vim-X11", "xz-utils": "xz",
+    "p7zip-full": "p7zip p7zip-plugins", "gnupg": "gnupg2",
+    "software-properties-common": "", "apt-transport-https": "", "lsb-release": "",
+    "dirmngr": "", "debconf": "", "apparmor": "", "apparmor-utils": "",
+    "ubuntu-standard": "", "ubuntu-drivers-common": "", "update-manager-core": "",
+    "locales": "glibc-langpack-en", "language-pack-ko": "glibc-langpack-ko",
+    "language-pack-en": "glibc-langpack-en",
+    "docker.io": "podman-docker", "ufw": "firewalld", "ntp": "chrony", "ntpdate": "chrony",
+    "iptables-persistent": "iptables-services", "nfs-common": "nfs-utils",
+    "nfs-kernel-server": "nfs-utils", "snmp": "net-snmp-utils", "snmpd": "net-snmp",
+    "mailutils": "mailx", "unattended-upgrades": "dnf-automatic", "needrestart": "dnf-utils",
+    "manpages-dev": "man-pages", "imagemagick": "ImageMagick",
+    "libmagickwand-dev": "ImageMagick-devel", "php-mysql": "php-mysqlnd",
+    "libpam-pwquality": "libpwquality", "libpam0g-dev": "pam-devel",
+    "isc-dhcp-server": "dhcp-server", "samba-common": "samba-common",
+    # -dev -> -devel
+    "libssl-dev": "openssl-devel", "zlib1g-dev": "zlib-devel", "zlib1g": "zlib",
+    "libcurl4-openssl-dev": "libcurl-devel", "libcurl4-gnutls-dev": "libcurl-devel",
+    "libsqlite3-dev": "sqlite-devel", "libreadline-dev": "readline-devel",
+    "libbz2-dev": "bzip2-devel", "liblzma-dev": "xz-devel",
+    "libncurses5-dev": "ncurses-devel", "libncursesw5-dev": "ncurses-devel",
+    "libncurses-dev": "ncurses-devel", "libjpeg-dev": "libjpeg-turbo-devel",
+    "libjpeg-turbo8-dev": "libjpeg-turbo-devel", "libpng-dev": "libpng-devel",
+    "libmysqlclient-dev": "mysql-devel", "default-libmysqlclient-dev": "mysql-devel",
+    "libpq-dev": "libpq-devel", "libpcre3-dev": "pcre-devel", "libpcre2-dev": "pcre2-devel",
+    "uuid-dev": "libuuid-devel", "libgdbm-dev": "gdbm-devel", "libsasl2-dev": "cyrus-sasl-devel",
+    "libldap2-dev": "openldap-devel", "libkrb5-dev": "krb5-devel", "libxslt1-dev": "libxslt-devel",
+    "libglib2.0-dev": "glib2-devel", "libgtk-3-dev": "gtk3-devel",
+    "libsystemd-dev": "systemd-devel", "libc6-dev": "glibc-devel",
+}
+
+PKG_NOTES = {
+    "docker.io": "docker.io 는 Rocky 기본 저장소에 없어 podman-docker 로 대체했습니다 "
+                 "(진짜 Docker 는 docker-ce 공식 저장소 추가 필요).",
+}
+
+# EPEL 저장소에 있는 패키지 -> 자동으로 epel-release 설치
+EPEL_PKGS = {"htop", "fail2ban", "certbot", "python3-certbot-nginx", "python3-certbot-apache",
+             "openvpn", "p7zip", "p7zip-plugins", "ncdu", "iftop", "nload", "screen",
+             "supervisor", "ansible", "neofetch", "ripgrep", "bat", "fd-find", "clamav", "rkhunter"}
+
+SERVICE_MAP = {
+    "apache2": "httpd", "ssh": "sshd", "cron": "crond", "mysql": "mysqld", "bind9": "named",
+    "redis-server": "redis", "ufw": "firewalld", "networking": "NetworkManager",
+    "isc-dhcp-server": "dhcpd", "smbd": "smb", "nmbd": "nmb", "ntp": "chronyd",
+    "chrony": "chronyd", "unattended-upgrades": "dnf-automatic.timer",
+}
+
+PATH_MAP = [
+    ("/etc/apt/sources.list.d", "/etc/yum.repos.d"),
+    ("/etc/apt/sources.list", "/etc/yum.repos.d/"),
+    ("/etc/apache2/sites-available", "/etc/httpd/conf.d"),
+    ("/etc/apache2/sites-enabled", "/etc/httpd/conf.d"),
+    ("/etc/apache2", "/etc/httpd"), ("/var/log/apache2", "/var/log/httpd"),
+    ("/var/run/apache2", "/run/httpd"),
+    ("/var/log/syslog", "/var/log/messages"), ("/var/log/auth.log", "/var/log/secure"),
+    ("/etc/mysql/mysql.conf.d", "/etc/my.cnf.d"), ("/etc/mysql/mariadb.conf.d", "/etc/my.cnf.d"),
+    ("/etc/mysql", "/etc/my.cnf.d"),
+    ("/etc/network/interfaces", "/etc/NetworkManager/system-connections/"),
+    ("/etc/netplan", "/etc/NetworkManager/system-connections"),
+]
+
+DEB_MSG = (".deb 패키지는 RPM 기반 시스템에 직접 설치할 수 없습니다. 같은 소프트웨어의 .rpm 을 받아 "
+           "'dnf install ./파일.rpm' 을 쓰거나 'dnf search 이름' 으로 대체 패키지를 찾으세요.")
+
+PROFILE_MAP = {"openssh": ["ssh"], "nginx full": ["http", "https"], "nginx http": ["http"],
+               "nginx https": ["https"], "apache full": ["http", "https"], "apache": ["http"],
+               "apache secure": ["https"]}
+
+
+# ───────────────────────── 패키지 이름 변환 ─────────────────────────
+def map_pkg(p, notes):
+    """return (group or None, [rpm names])"""
+    if p in GROUP_MAP:
+        return GROUP_MAP[p], []
+    if p in PKG_MAP:
+        v = PKG_MAP[p].split()
+        if not v:
+            notes.append("'%s' 는 RHEL 계열에 대응 패키지가 없거나 불필요하여 제외했습니다." % p)
+        if p in PKG_NOTES:
+            notes.append(PKG_NOTES[p])
+        return None, v
+    m = re.match(r"^php\d+(?:\.\d+)?-(.+)$", p)
+    if m:
+        return None, ["php-" + m.group(1)]
+    m = re.match(r"^openjdk-(\d+)-(jdk|jre)(?:-headless)?$", p)
+    if m:
+        ver = "1.8.0" if m.group(1) == "8" else m.group(1)
+        return None, ["java-%s-openjdk%s" % (ver, "-devel" if m.group(2) == "jdk" else "")]
+    if p.startswith("linux-headers-"):
+        return None, ["kernel-devel", "kernel-headers"]
+    if p.endswith("-dev"):
+        return None, [p[:-4] + "-devel"]
+    return None, [p]
+
+
+def pkgs_of(items, notes):
+    names, groups = [], []
+    for it in items:
+        if it.endswith(".deb"):
+            raise Unsupported(DEB_MSG)
+        base, ver = it, None
+        if "=" in base:
+            base, ver = base.split("=", 1)
+        if "/" in base and not base.startswith(("/", ".")):
+            base = base.split("/")[0]
+        g, ns = map_pkg(base, notes)
+        if g and g not in groups:
+            groups.append(g)
+        for n in ns:
+            n = n + "-" + ver if ver and len(ns) == 1 else n
+            if n not in names:
+                names.append(n)
+    return names, groups
+
+
+def map_service(s):
+    suffix = ""
+    if s.endswith(".service"):
+        s, suffix = s[:-8], ".service"
+    if re.match(r"^php\d+(\.\d+)?-fpm$", s):
+        return "php-fpm" + suffix
+    return SERVICE_MAP.get(s, s) + suffix
+
+
+def conv_flags(args):
+    flags, rest = [], []
+    for a in args:
+        if a.startswith("--"):
+            if a in ("--yes", "--assume-yes", "--force-yes"):
+                flags.append("-y")
+            elif a == "--no-install-recommends":
+                flags.append("--setopt=install_weak_deps=False")
+            elif a == "--quiet":
+                flags.append("-q")
+            elif a in ("--installed", "--upgradable", "--names-only"):
+                rest.append(a)
+        elif a.startswith("-") and len(a) > 1 and a[1:].isalpha():
+            for ch in a[1:]:
+                if ch == "y":
+                    flags.append("-y")
+                elif ch == "q":
+                    flags.append("-q")
+        else:
+            rest.append(a)
+    seen, out = set(), []
+    for f in flags:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out, rest
+
+
+EPEL_CMD = ["sh", "-c", "rpm -q epel-release >/dev/null 2>&1 || dnf install -y epel-release"]
+LOCK_CMD = ["sh", "-c", "rpm -q python3-dnf-plugin-versionlock >/dev/null 2>&1 || "
+                        "dnf install -y python3-dnf-plugin-versionlock"]
+
+
+# ───────────────────────── 핸들러들 (각각 [명령토큰리스트, ...] 반환) ─────────────────────────
+def h_apt(args, notes):
+    flags, rest = conv_flags(args)
+    if not rest:
+        raise Unsupported("apt 서브커맨드가 없습니다.")
+    sub = rest[0]
+    opts = [x for x in rest[1:] if x.startswith("--")]
+    items = [x for x in rest[1:] if not x.startswith("--")]
+
+    if sub in ("install", "reinstall"):
+        names, groups = pkgs_of(items, notes)
+        cmds = []
+        if any(n in EPEL_PKGS for n in names):
+            cmds.append(EPEL_CMD)
+            notes.append("EPEL 저장소 패키지가 포함되어 epel-release 를 먼저 설치합니다.")
+        for g in groups:
+            cmds.append(["dnf", "group", "install"] + flags + [g])
+        if names:
+            cmds.append(["dnf", sub] + flags + names)
+        if not cmds:
+            cmds.append(["dnf", sub] + flags if not items else ["true"])
+        return cmds
+    if sub in ("remove", "purge", "autoremove", "autopurge"):
+        names, _ = pkgs_of(items, notes)
+        verb = "autoremove" if sub.startswith("auto") else "remove"
+        return [["dnf", verb] + flags + names]
+    if sub == "update":
+        return [["dnf", "makecache"] + [f for f in flags if f == "-q"]]
+    if sub in ("upgrade", "dist-upgrade", "full-upgrade"):
+        names, _ = pkgs_of(items, notes)
+        return [["dnf", "upgrade"] + flags + names]
+    if sub in ("clean", "autoclean"):
+        return [["dnf", "clean", "all"]]
+    if sub == "search":
+        return [["dnf", "search"] + items]
+    if sub in ("show", "info", "policy"):
+        names, _ = pkgs_of(items, notes)
+        return [["dnf", "info"] + names]
+    if sub == "madison":
+        names, _ = pkgs_of(items, notes)
+        return [["dnf", "list", "--showduplicates"] + names]
+    if sub == "list":
+        names, _ = pkgs_of(items, notes)
+        if "--installed" in opts:
+            return [["dnf", "list", "installed"] + names]
+        if "--upgradable" in opts:
+            return [["dnf", "list", "--upgrades"]]
+        return [["dnf", "list"] + names]
+    if sub == "depends":
+        names, _ = pkgs_of(items, notes)
+        return [["dnf", "repoquery", "--requires"] + names]
+    if sub == "rdepends":
+        names, _ = pkgs_of(items, notes)
+        return [["dnf", "repoquery", "--whatrequires"] + names]
+    if sub == "download":
+        names, _ = pkgs_of(items, notes)
+        return [["dnf", "download"] + names]
+    if sub == "build-dep":
+        names, _ = pkgs_of(items, notes)
+        return [["dnf", "builddep"] + flags + names]
+    raise Unsupported("지원하지 않는 apt 서브커맨드: %s" % sub)
+
+
+def h_aptmark(args, notes):
+    flags, rest = conv_flags(args)
+    sub = rest[0] if rest else ""
+    names, _ = pkgs_of(rest[1:], notes)
+    if sub == "hold":
+        return [LOCK_CMD, ["dnf", "versionlock", "add"] + names]
+    if sub == "unhold":
+        return [LOCK_CMD, ["dnf", "versionlock", "delete"] + names]
+    if sub == "showhold":
+        return [LOCK_CMD, ["dnf", "versionlock", "list"]]
+    if sub == "manual":
+        return [["dnf", "mark", "install"] + names]
+    if sub == "auto":
+        return [["dnf", "mark", "remove"] + names]
+    raise Unsupported("지원하지 않는 apt-mark 서브커맨드: %s" % sub)
+
+
+def h_dpkg(args, notes):
+    if not args:
+        raise Unsupported("dpkg 옵션이 필요합니다.")
+    op = args[0]
+    items = [a for a in args[1:] if not a.startswith("-")]
+    if op in ("-i", "--install", "-R", "--unpack"):
+        raise Unsupported(DEB_MSG)
+    if op in ("-l", "--list", "--get-selections"):
+        cmd = "rpm -qa | sort"
+        if items:
+            cmd += " | grep -i -- " + shlex.quote(items[0].replace("*", ""))
+        return [["sh", "-c", cmd]]
+    if op in ("-S", "--search"):
+        return [["rpm", "-qf"] + items]
+    if op == "--print-architecture":
+        return [["rpm", "--eval", "%{_arch}"]]
+    if op == "--configure":
+        return [["true"]]
+    names, _ = pkgs_of(items, notes)
+    if op in ("-L", "--listfiles"):
+        return [["rpm", "-ql"] + names]
+    if op in ("-s", "--status"):
+        return [["rpm", "-qi"] + names]
+    if op in ("-W", "--show"):
+        return [["rpm", "-q"] + names]
+    if op in ("-V", "--verify"):
+        return [["rpm", "-V"] + names]
+    if op in ("-r", "--remove", "-P", "--purge"):
+        return [["dnf", "remove"] + names]
+    raise Unsupported("지원하지 않는 dpkg 옵션: %s" % op)
+
+
+def h_addrepo(args, notes):
+    items = [a for a in args if not a.startswith("-")]
+    if not items:
+        raise Unsupported("add-apt-repository 대상이 없습니다.")
+    t = items[0]
+    if t.startswith("ppa:"):
+        raise Unsupported("PPA 는 Ubuntu 전용입니다. 대신 COPR(dnf copr enable 사용자/프로젝트)이나 "
+                          "공식 .repo 파일을 쓰세요.")
+    if t in ("universe", "multiverse", "restricted"):
+        notes.append("universe/multiverse 에 해당하는 EPEL + CRB(PowerTools) 를 활성화합니다.")
+        return [["dnf", "install", "-y", "epel-release"],
+                ["sh", "-c", "dnf config-manager --set-enabled crb 2>/dev/null || "
+                             "dnf config-manager --set-enabled powertools"]]
+    if t.startswith(("http://", "https://")):
+        return [["dnf", "config-manager", "--add-repo", t]]
+    raise Unsupported("이 형식의 저장소 추가는 자동 변환할 수 없습니다: %s" % t)
+
+
+def h_aptkey(args, notes):
+    if args[:1] == ["add"] and len(args) >= 2:
+        return [["rpm", "--import", "/dev/stdin" if args[1] == "-" else args[1]]]
+    if args[:1] == ["list"]:
+        return [["rpm", "-qa", "gpg-pubkey*"]]
+    raise Unsupported("apt-key 는 'rpm --import <키 URL 또는 파일>' 로 대체하세요.")
+
+
+def ufw_rules(action, toks, remove):
+    src = port = proto = None
+    names = []
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t == "from" and i + 1 < len(toks):
+            src = None if toks[i + 1] == "any" else toks[i + 1]
+            i += 2
+        elif t == "to" and i + 1 < len(toks):
+            i += 2
+        elif t == "port" and i + 1 < len(toks):
+            port = toks[i + 1]
+            i += 2
+        elif t == "proto" and i + 1 < len(toks):
+            proto = toks[i + 1]
+            i += 2
+        elif t == "comment":
+            i += 2
+        elif t in ("in", "out", "app"):
+            i += 1
+        else:
+            m = re.match(r"^(\d+(?::\d+)?)(?:/(tcp|udp))?$", t)
+            if m and port is None:
+                port, proto = m.group(1), proto or m.group(2)
+            else:
+                names.append(t)
+            i += 1
+    if port and "/" in port:
+        port, proto = port.split("/", 1)
+    if port:
+        port = port.replace(":", "-")
+    protos = [proto] if proto else ["tcp", "udp"]
+    verb = "remove" if remove else "add"
+    svcs = None
+    if names:
+        nm = " ".join(names).lower()
+        svcs = PROFILE_MAP.get(nm, [nm])
+    out = []
+    if src is None and action in ("allow", "limit"):
+        if svcs and not port:
+            out += ["--%s-service=%s" % (verb, s) for s in svcs]
+        elif port:
+            out += ["--%s-port=%s/%s" % (verb, port, p) for p in protos]
+        else:
+            raise Unsupported("ufw 규칙을 해석할 수 없습니다.")
+    else:
+        fam = "ipv6" if src and ":" in src else "ipv4"
+        verdict = {"allow": "accept", "limit": "accept", "deny": "drop", "reject": "reject"}[action]
+        base = 'rule family="%s"' % fam + (' source address="%s"' % src if src else "")
+        if svcs and not port:
+            rules = [base + ' service name="%s" %s' % (s, verdict) for s in svcs]
+        elif port:
+            rules = [base + ' port port="%s" protocol="%s" %s' % (port, p, verdict) for p in protos]
+        elif src:
+            rules = [base + " " + verdict]
+        else:
+            raise Unsupported("ufw 규칙을 해석할 수 없습니다.")
+        out += ["--%s-rich-rule=%s" % (verb, r) for r in rules]
+    return [["firewall-cmd", "--permanent", x] for x in out] + [["firewall-cmd", "--reload"]]
+
+
+def h_ufw(args, notes):
+    a = [x for x in args if not x.startswith("--")]
+    if not a:
+        raise Unsupported("ufw 서브커맨드가 필요합니다.")
+    sub, rest = a[0], a[1:]
+    if sub == "enable":
+        return [["systemctl", "enable", "--now", "firewalld"]]
+    if sub == "disable":
+        return [["systemctl", "disable", "--now", "firewalld"]]
+    if sub == "status":
+        return [["sh", "-c", "firewall-cmd --state && firewall-cmd --list-all"]]
+    if sub == "reload":
+        return [["firewall-cmd", "--reload"]]
+    if sub == "logging":
+        return [["firewall-cmd", "--set-log-denied=" + ("off" if rest[:1] == ["off"] else "all")]]
+    if sub == "default":
+        notes.append("firewalld 의 기본 zone 은 이미 '들어오는 연결 차단'이라 변경하지 않습니다.")
+        return [["true"]]
+    if sub == "app":
+        return [["firewall-cmd", "--get-services"]]
+    remove = False
+    if sub == "delete":
+        if not rest or rest[0] not in ("allow", "deny", "reject", "limit"):
+            raise Unsupported("'ufw delete <번호>' 는 지원하지 않습니다. 'ufw delete allow 80' 형식을 쓰세요.")
+        sub, rest, remove = rest[0], rest[1:], True
+    if sub == "insert" and len(rest) >= 2:
+        sub, rest = rest[1], rest[2:]
+    if sub in ("allow", "deny", "reject", "limit"):
+        if sub == "limit":
+            notes.append("ufw limit 은 firewalld 에 없어 allow 로 처리합니다 (rate limit 은 fail2ban 권장).")
+        return ufw_rules(sub, rest, remove)
+    raise Unsupported("지원하지 않는 ufw 서브커맨드: %s" % sub)
+
+
+def h_adduser(args, notes):
+    flags = [a for a in args if a.startswith("--")]
+    pos, opts, i = [], [], 0
+    keymap = {"--home": "-d", "--shell": "-s", "--gecos": "-c", "--ingroup": "-g", "--uid": "-u", "--gid": "-g"}
+    while i < len(args):
+        a = args[i]
+        if a in keymap and i + 1 < len(args):
+            opts += [keymap[a], args[i + 1]]
+            i += 2
+            continue
+        if a == "--system":
+            opts.append("-r")
+        elif not a.startswith("-"):
+            pos.append(a)
+        i += 1
+    if len(pos) == 2:
+        return [["usermod", "-aG", pos[1], pos[0]]]
+    if len(pos) != 1:
+        raise Unsupported("adduser 사용법: adduser <사용자> [그룹]")
+    if "-r" in opts:
+        return [["useradd"] + opts + [pos[0]]]
+    if "-s" not in opts:
+        opts += ["-s", "/bin/bash"]
+    cmds = [["useradd", "-m"] + opts + [pos[0]]]
+    if "--disabled-password" not in flags and "--disabled-login" not in flags:
+        cmds.append(["passwd", pos[0]])
+    return cmds
+
+
+def h_deluser(args, notes):
+    pos = [a for a in args if not a.startswith("-")]
+    rm = any(a in ("--remove-home", "--remove-all-files") for a in args)
+    if len(pos) == 2:
+        return [["gpasswd", "-d", pos[0], pos[1]]]
+    if len(pos) != 1:
+        raise Unsupported("deluser 사용법: deluser [--remove-home] <사용자> [그룹]")
+    return [["userdel"] + (["-r"] if rm else []) + [pos[0]]]
+
+
+def h_addgroup(args, notes):
+    pos = [a for a in args if not a.startswith("-")]
+    opts = ["-r"] if "--system" in args else []
+    if "--gid" in args:
+        k = args.index("--gid")
+        if k + 1 < len(args):
+            opts += ["-g", args[k + 1]]
+            pos = [p for p in pos if p != args[k + 1]]
+    if len(pos) == 2:
+        return [["usermod", "-aG", pos[1], pos[0]]]
+    return [["groupadd"] + opts + pos[:1]]
+
+
+def h_delgroup(args, notes):
+    pos = [a for a in args if not a.startswith("-")]
+    return [["groupdel"] + pos[:1]]
+
+
+def h_altern(args, notes):
+    args = ["--display" if a == "--list" else a for a in args]
+    return [["alternatives"] + args]
+
+
+def h_lsb(args, notes):
+    chars = set("".join(x[1:] for x in args if x.startswith("-") and not x.startswith("--")))
+    short = "s" in chars or "--short" in args
+    if "a" in chars or "--all" in args or not (chars & set("idrc")):
+        return [["cat", "/etc/os-release"]]
+    spec = {"i": ("Distributor ID", "${NAME%% *}"), "d": ("Description", "$PRETTY_NAME"),
+            "r": ("Release", "$VERSION_ID"), "c": ("Codename", "n/a")}
+    lines = []
+    for k in "idrc":
+        if k in chars:
+            label, val = spec[k]
+            lines.append('echo "%s"' % (val if short else "%s:\t%s" % (label, val)))
+    return [["sh", "-c", ". /etc/os-release; " + "; ".join(lines)]]
+
+
+def h_grub(args, notes):
+    ver = ""
+    try:
+        for line in open("/etc/os-release"):
+            if line.startswith("VERSION_ID="):
+                ver = line.split("=", 1)[1].strip().strip('"')
+    except IOError:
+        pass
+    out = "/boot/grub2/grub.cfg"
+    if os.path.isdir("/sys/firmware/efi") and ver.startswith("8"):
+        out = "/boot/efi/EFI/rocky/grub.cfg"
+    return [["grub2-mkconfig", "-o", out]]
+
+
+def h_updaterc(args, notes):
+    pos = [a for a in args if not a.startswith("-")]
+    if len(pos) >= 2:
+        name, act = map_service(pos[0]), pos[1]
+        if act in ("defaults", "enable"):
+            return [["systemctl", "enable", name]]
+        if act in ("disable", "remove"):
+            return [["systemctl", "disable", name]]
+    raise Unsupported("update-rc.d 사용법: update-rc.d <서비스> defaults|enable|disable")
+
+
+def h_invoke(args, notes):
+    pos = [a for a in args if not a.startswith("-")]
+    if len(pos) >= 2:
+        return [["systemctl", pos[1], map_service(pos[0])]]
+    raise Unsupported("invoke-rc.d 사용법: invoke-rc.d <서비스> <동작>")
+
+
+def h_netplan(args, notes):
+    if args[:1] in (["apply"], ["try"]):
+        return [["systemctl", "restart", "NetworkManager"]]
+    if args[:1] == ["generate"]:
+        return [["true"]]
+    raise Unsupported("netplan 은 NetworkManager(nmcli / nmtui) 로 대체하세요.")
+
+
+HANDLERS = {
+    "apt": h_apt, "apt-get": h_apt, "apt-cache": h_apt, "aptitude": h_apt, "apt-mark": h_aptmark,
+    "dpkg": h_dpkg, "dpkg-query": h_dpkg, "add-apt-repository": h_addrepo, "apt-key": h_aptkey,
+    "ufw": h_ufw, "adduser": h_adduser, "deluser": h_deluser, "addgroup": h_addgroup,
+    "delgroup": h_delgroup, "update-alternatives": h_altern, "lsb_release": h_lsb,
+    "update-grub": h_grub, "update-grub2": h_grub, "update-rc.d": h_updaterc,
+    "invoke-rc.d": h_invoke, "netplan": h_netplan,
+}
+
+
+# ───────────────────────── 셸 라인 파싱 / 변환 ─────────────────────────
+def split_shell(line):
+    """따옴표를 존중하며 && || ; | & 개행 으로 분리. [(kind, text)]"""
+    parts, buf, q, i, n = [], [], None, 0, len(line)
+
+    def flush():
+        if buf:
+            parts.append(("cmd", "".join(buf)))
+            del buf[:]
+
+    while i < n:
+        c = line[i]
+        if q:
+            buf.append(c)
+            if c == "\\" and q == '"' and i + 1 < n:
+                buf.append(line[i + 1])
+                i += 1
+            elif c == q:
+                q = None
+        elif c in "'\"":
+            q = c
+            buf.append(c)
+        elif c == "\\" and i + 1 < n:
+            buf.append(c + line[i + 1])
+            i += 1
+        elif line.startswith("&&", i) or line.startswith("||", i):
+            flush()
+            parts.append(("op", line[i:i + 2]))
+            i += 1
+        elif c in ";|\n":
+            flush()
+            parts.append(("op", c))
+        elif c == "&" and not (i > 0 and line[i - 1] in "<>") and not (i + 1 < n and line[i + 1] == ">"):
+            flush()
+            parts.append(("op", c))
+        else:
+            buf.append(c)
+        i += 1
+    flush()
+    return parts
+
+
+REDIR_RE = re.compile(r"((?:\s+(?:\d*>>?|\d*<|&>>?)\s*&?\S+)+)$")
+ENV_RE = re.compile(r"^[A-Za-z_]\w*=")
+SUDO_ARG_OPTS = {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-T", "-U", "-R"}
+
+
+def translate_segment(seg, notes, alone):
+    core = seg.strip()
+    if not core:
+        return seg
+    lead = seg[:len(seg) - len(seg.lstrip())]
+    trail = seg[len(seg.rstrip()):]
+    redir = ""
+    m = REDIR_RE.search(core)
+    if m:
+        redir, core = m.group(1), core[:m.start()]
+    try:
+        tokens = shlex.split(core)
+    except ValueError:
+        return seg
+
+    prefix, i = [], 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t == "sudo":
+            prefix.append(t)
+            i += 1
+            while i < len(tokens) and tokens[i].startswith("-") and tokens[i] != "--":
+                prefix.append(tokens[i])
+                if tokens[i] in SUDO_ARG_OPTS and i + 1 < len(tokens):
+                    i += 1
+                    prefix.append(tokens[i])
+                i += 1
+        elif ENV_RE.match(t):
+            if not t.startswith(("DEBIAN_FRONTEND=", "DEBCONF_", "NEEDRESTART_")):
+                prefix.append(t)
+            i += 1
+        elif t == "env":
+            prefix.append(t)
+            i += 1
+        else:
+            break
+    cmd = tokens[i:]
+    if not cmd:
+        return seg
+    name = os.path.basename(cmd[0])
+    handler = HANDLERS.get(name)
+
+    if handler is None:
+        new = seg
+        for old, rep in PATH_MAP:
+            new = new.replace(old, rep)
+        if name in ("systemctl", "service", "journalctl"):
+            for k, v in SERVICE_MAP.items():
+                new = re.sub(r"(?<![\w./-])" + re.escape(k) + r"(?=\.service|[\s'\"]|$)", v, new)
+            new = re.sub(r"(?<![\w./-])php\d+(?:\.\d+)?-fpm(?=\.service|[\s'\"]|$)", "php-fpm", new)
+        return new
+
+    pre = J(prefix) + " " if prefix else ""
+    try:
+        cmds = handler(cmd[1:], notes)
+        body = " && ".join(pre + J(c) for c in cmds)
+        if len(cmds) > 1 and (redir or not alone):
+            body = "{ %s; }" % body
+    except Unsupported as e:
+        body = "{ printf '%%s\\n' %s >&2; false; }" % shlex.quote("deb2rpm: " + str(e))
+    return lead + body + redir + trail
+
+
+def translate_line(line, notes):
+    parts = split_shell(line)
+    alone = len([p for p in parts if p[0] == "cmd" and p[1].strip()]) == 1 and \
+        not any(p[0] == "op" for p in parts)
+    return "".join(t if k == "op" else translate_segment(t, notes, alone) for k, t in parts)
+
+
+# ───────────────────────── 실행 ─────────────────────────
+def err(msg):
+    sys.stderr.write(msg + "\n")
+
+
+def paint(code, text):
+    return "\033[%sm%s\033[0m" % (code, text) if sys.stderr.isatty() else text
+
+
+def execute(line, dry=False, confirm=False, quiet=False):
+    notes = []
+    new = translate_line(line, notes)
+    for n in notes:
+        err(paint("33", "ℹ  " + n))
+    if new.strip() != line.strip() and not quiet:
+        err(paint("36", "→ " + new))
+    if dry:
+        return 0
+    if confirm and new.strip() != line.strip():
+        try:
+            if input("실행할까요? [Y/n] ").strip().lower() in ("n", "no"):
+                return 1
+        except EOFError:
+            return 1
+    return subprocess.call(["bash", "-c", new])
+
+
+def repl(dry, confirm, quiet):
+    try:
+        import readline  # noqa: F401
+    except ImportError:
+        pass
+    err("deb2rpm %s - 우분투 명령을 입력하면 Rocky 명령으로 변환해 실행합니다. (exit 로 종료)" % VERSION)
+    while True:
+        try:
+            line = input("\001\033[1;32m\002deb2rpm\001\033[0m\002:%s$ " % os.getcwd())
+        except EOFError:
+            print()
+            break
+        except KeyboardInterrupt:
+            print()
+            continue
+        s = line.strip()
+        if not s:
+            continue
+        if s in ("exit", "quit"):
+            break
+        if s == "cd" or s.startswith("cd "):
+            try:
+                os.chdir(os.path.expanduser(s[2:].strip() or "~"))
+            except OSError as e:
+                err("cd: %s" % e)
+            continue
+        execute(line, dry, confirm, quiet)
+
+
+def install():
+    if os.geteuid() != 0:
+        err("root 권한이 필요합니다:  sudo %s --install" % sys.argv[0])
+        return 1
+    src = os.path.realpath(__file__)
+    if src != SELF_PATH:
+        shutil.copyfile(src, SELF_PATH)
+    os.chmod(SELF_PATH, 0o755)
+    print("설치: %s" % SELF_PATH)
+    for name in SHIMS:
+        dst = os.path.join(LINK_DIR, name)
+        if os.path.lexists(dst):
+            if os.path.islink(dst) and os.path.realpath(dst) == SELF_PATH:
+                continue
+            print("건너뜀(이미 존재): %s" % dst)
+            continue
+        os.symlink(SELF_PATH, dst)
+        print("링크: %s" % dst)
+    print("\n완료! 이제 'apt install -y nginx', 'sudo ufw allow 80' 처럼 그대로 입력하세요.")
+    print("참고: adduser 는 RHEL 에도 (useradd 로 연결된) 자체 명령이 있어 건드리지 않았습니다.")
+    print("      우분투식 adduser 변환이 필요하면 'deb2rpm adduser 이름' 으로 호출하세요.")
+    return 0
+
+
+def uninstall():
+    if os.geteuid() != 0:
+        err("root 권한이 필요합니다:  sudo deb2rpm --uninstall")
+        return 1
+    for name in SHIMS:
+        dst = os.path.join(LINK_DIR, name)
+        if os.path.islink(dst) and os.path.realpath(dst) == SELF_PATH:
+            os.remove(dst)
+            print("삭제: %s" % dst)
+    if os.path.exists(SELF_PATH):
+        os.remove(SELF_PATH)
+        print("삭제: %s" % SELF_PATH)
+    return 0
+
+
+HELP = """deb2rpm %s - Ubuntu/Debian 명령 -> Rocky Linux(RHEL) 명령 자동 변환 실행기
+
+사용법:
+  deb2rpm [옵션] <우분투 명령...>      변환 후 실행
+  deb2rpm [옵션] "cmd1 && cmd2"        따옴표로 묶으면 여러 명령도 가능
+  deb2rpm                              대화형 모드
+옵션:
+  -n, --dry-run     변환 결과만 보여주고 실행하지 않음
+  -c, --confirm     실행 전에 확인
+  -q, --quiet       변환된 명령 표시 안 함
+  --install         (sudo) apt, dpkg, ufw ... 를 직접 입력해도 동작하도록 설치
+  --uninstall       (sudo) 제거
+  -h, --help        도움말
+""" % VERSION
+
+
+def main():
+    invoked = os.path.basename(sys.argv[0])
+    args = sys.argv[1:]
+
+    # apt, dpkg, ufw ... 심볼릭 링크로 호출된 경우
+    if invoked in HANDLERS:
+        return execute(J([invoked] + args), quiet=bool(os.environ.get("DEB2RPM_QUIET")))
+
+    dry = confirm = quiet = False
+    while args and args[0].startswith("-"):
+        o = args.pop(0)
+        if o in ("-n", "--dry-run"):
+            dry = True
+        elif o in ("-c", "--confirm"):
+            confirm = True
+        elif o in ("-q", "--quiet"):
+            quiet = True
+        elif o == "--install":
+            return install()
+        elif o == "--uninstall":
+            return uninstall()
+        elif o in ("-h", "--help"):
+            print(HELP)
+            return 0
+        else:
+            err("알 수 없는 옵션: %s\n" % o + HELP)
+            return 2
+    if not args:
+        repl(dry, confirm, quiet)
+        return 0
+    line = args[0] if len(args) == 1 else J(args)
+    return execute(line, dry, confirm, quiet)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
